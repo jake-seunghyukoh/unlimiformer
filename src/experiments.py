@@ -20,9 +20,9 @@ short_name = base_name.split("/")[-1]
 
 tokenizer = AutoTokenizer.from_pretrained(base_name)
 
-config = AutoConfig.from_pretrained(base_name)
+# config = AutoConfig.from_pretrained(base_name)
 
-model = LlamaForCausalLM(config)
+model = LlamaForCausalLM.from_pretrained(base_name)
 
 # Tie weights
 model.tie_weights()
