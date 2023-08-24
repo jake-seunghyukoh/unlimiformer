@@ -21,19 +21,19 @@ short_name = base_name.split("/")[-1]
 tokenizer = AutoTokenizer.from_pretrained(base_name)
 
 config = AutoConfig.from_pretrained(base_name)
-with init_empty_weights():
-    model = LlamaForCausalLM(config)
+
+model = LlamaForCausalLM(config)
 
 # Tie weights
 model.tie_weights()
 
-model = load_checkpoint_and_dispatch(
-    model,
-    base_name,
-    dtype=dtype,
-    device_map="auto",
-    no_split_module_classes=["LlamaDecoderLayer"],
-)
+# model = load_checkpoint_and_dispatch(
+#     model,
+#     base_name,
+#     dtype=dtype,
+#     device_map="auto",
+#     no_split_module_classes=["LlamaDecoderLayer"],
+# )
 
 defaults = UnlimiformerArguments()
 unlimiformer_kwargs = {
