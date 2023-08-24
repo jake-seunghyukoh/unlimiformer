@@ -16,20 +16,24 @@ class CustomHfArgumentParser(HfArgumentParser):
         args = []
         data = {}
         for i in range(1, len(sys.argv)):
-            if not sys.argv[i].endswith('.json'):
+            if not sys.argv[i].endswith(".json"):
                 break
 
             with open(sys.argv[i]) as f:
                 new_data = json.load(f)
             conflicting_keys = set(new_data.keys()).intersection(data.keys())
             if len(conflicting_keys) > 0:
-                raise ValueError(f'There are conflicting keys in the config files: {conflicting_keys}')
+                raise ValueError(
+                    f"There are conflicting keys in the config files: {conflicting_keys}"
+                )
             data.update(new_data)
 
         for k, v in data.items():
             # if any options were given explicitly through the CLA then they override anything defined in the config files
-            if f'--{k}' in sys.argv:
-                logging.info(f'While {k}={v} was given in a config file, a manual override was set through the CLA')
+            if f"--{k}" in sys.argv:
+                logging.info(
+                    f"While {k}={v} was given in a config file, a manual override was set through the CLA"
+                )
                 continue
             args.extend(
                 ["--" + k, *(v if isinstance(v, list) else [str(v)])]

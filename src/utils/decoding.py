@@ -1,4 +1,5 @@
 from functools import partial
+
 import numpy as np
 
 
@@ -18,13 +19,17 @@ def decode(id_to_something, tokenizer=None, data_args=None):
             decode_fn = lambda token_ids_list: [
                 text.strip()
                 for text in partial(
-                    tokenizer.batch_decode, skip_special_tokens=True, clean_up_tokenization_spaces=True
+                    tokenizer.batch_decode,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
                 )(token_ids_list)
             ]
     else:
         switch_case = 2
         decode_fn = lambda token_ids: partial(
-            tokenizer.decode, skip_special_tokens=True, clean_up_tokenization_spaces=True
+            tokenizer.decode,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True,
         )(token_ids).strip()
 
     id_to_text = {}
@@ -41,7 +46,9 @@ def decode(id_to_something, tokenizer=None, data_args=None):
                 if switch_case == 1:
                     token_ids_list = something
                     for i in range(len(token_ids_list)):
-                        token_ids_list[i] = _replace_padding(token_ids_list[i], tokenizer.pad_token_id)
+                        token_ids_list[i] = _replace_padding(
+                            token_ids_list[i], tokenizer.pad_token_id
+                        )
                     obj_to_decode = token_ids_list
                 elif switch_case == 2:
                     token_ids = something

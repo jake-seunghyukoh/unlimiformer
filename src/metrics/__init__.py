@@ -1,1 +1,1 @@
-from .metrics import load_metric, download_metric
+from .metrics import download_metric, load_metric

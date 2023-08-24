@@ -21,59 +21,63 @@ import logging
 import os
 import sys
 
-import numpy as np
-from unlimiformer import Unlimiformer
-from random_training_unlimiformer import RandomTrainingUnlimiformer
-
 import nltk
+import numpy as np
+import torch
+import wandb
+
+from random_training_unlimiformer import RandomTrainingUnlimiformer
+from unlimiformer import Unlimiformer
 
 # we import the logging frameworks before any other import to make sure all monkey patching for the logging are active
 # from sled import SledConfig
 
-import wandb
-import torch
 
 sys.path.insert(0, os.path.dirname(__file__))  # seq2seq package path
 sys.path.insert(0, os.getcwd())
 
-from dataclasses import dataclass, field
-from typing import List, Optional
 import json
 from copy import deepcopy
-import torch.nn.functional as F
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import datasets
-
+import torch.nn.functional as F
 import transformers
+from datasets import load_dataset
 from transformers import (
+    WEIGHTS_NAME,
     AutoConfig,
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
+    DataCollatorForSeq2Seq,
     EarlyStoppingCallback,
-    set_seed, WEIGHTS_NAME,
+    set_seed,
 )
 from transformers.trainer_utils import get_last_checkpoint
-from transformers import DataCollatorForSeq2Seq
 
-from datasets import load_dataset
+from metrics import load_metric
+from metrics.metrics import HFMetricWrapper, MetricCollection
+from utils.config import handle_args_to_ignore
+from utils.custom_hf_argument_parser import CustomHfArgumentParser
+from utils.custom_seq2seq_trainer import CustomTrainer
+from utils.decoding import decode
+from utils.duplicates import drop_duplicates_in_input
+from utils.override_training_args import TrainingOverridesArguments
 
 # noinspection PyUnresolvedReferences
 # import sled  # *** required so that SledModels will be registered for the AutoClasses ***
 
-from utils.config import handle_args_to_ignore
-from utils.decoding import decode
-from metrics import load_metric
-from utils.duplicates import drop_duplicates_in_input
-from utils.override_training_args import TrainingOverridesArguments
-from utils.custom_seq2seq_trainer import CustomTrainer
-from utils.custom_hf_argument_parser import CustomHfArgumentParser
-from metrics.metrics import HFMetricWrapper, MetricCollection
 
-logger = logging.getLogger('sled')
+logger = logging.getLogger("sled")
 
-PREFIX_DOC_SEP = '\n\n'
+PREFIX_DOC_SEP = "\n\n"
 
-DEBUG = os.environ.get('DEBUG', 'false').lower() in {'1', 'true', 'yes'}  # If set, will set some configuration to help debug
+DEBUG = os.environ.get("DEBUG", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}  # If set, will set some configuration to help debug
 if DEBUG:
     assert not torch.cuda.is_available() or torch.cuda.device_count() == 1
 
@@ -85,25 +89,40 @@ class ModelArguments:
     """
 
     model_name_or_path: str = field(
-        default=None, metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+        default=None,
+        metadata={
+            "help": "Path to pretrained model or model identifier from huggingface.co/models"
+        },
     )
     config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+        default=None,
+        metadata={
+            "help": "Pretrained config name or path if not the same as model_name"
+        },
     )
     tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+        default=None,
+        metadata={
+            "help": "Pretrained tokenizer name or path if not the same as model_name"
+        },
     )
     cache_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Where to store the pretrained models downloaded from huggingface.co"},
+        metadata={
+            "help": "Where to store the pretrained models downloaded from huggingface.co"
+        },
     )
     use_fast_tokenizer: bool = field(
         default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+        metadata={
+            "help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."
+        },
     )
     model_revision: str = field(
         default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
+        metadata={
+            "help": "The specific model version to use (can be a branch name, tag name or commit id)."
+        },
     )
     drop_duplicates_in_eval: bool = field(
         default=True,
@@ -111,7 +130,6 @@ class ModelArguments:
 
     def __post_init__(self):
         pass
-    
 
 
 @dataclass
@@ -127,7 +145,10 @@ class DataTrainingArguments:
         },
     )
     dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+        default=None,
+        metadata={
+            "help": "The configuration name of the dataset to use (via the datasets library)."
+        },
     )
     metric_names: Optional[List[str]] = field(
         default=None,
@@ -135,18 +156,25 @@ class DataTrainingArguments:
     )
     input_column: Optional[str] = field(
         default=None,
-        metadata={"help": "The name of the column in the datasets containing the full texts (for summarization)."},
+        metadata={
+            "help": "The name of the column in the datasets containing the full texts (for summarization)."
+        },
     )
     input_prefix_column: Optional[str] = field(
         default=None,
-        metadata={"help": "The name of the column in the datasets containing the input prefix (e.g. questions), when those exist."},
+        metadata={
+            "help": "The name of the column in the datasets containing the input prefix (e.g. questions), when those exist."
+        },
     )
     output_column: Optional[str] = field(
         default=None,
-        metadata={"help": "The name of the column in the datasets containing the summaries (for summarization)."},
+        metadata={
+            "help": "The name of the column in the datasets containing the summaries (for summarization)."
+        },
     )
     train_file: Optional[str] = field(
-        default=None, metadata={"help": "The input training data file (a jsonlines or csv file)."}
+        default=None,
+        metadata={"help": "The input training data file (a jsonlines or csv file)."},
     )
     validation_file: Optional[str] = field(
         default=None,
@@ -158,11 +186,13 @@ class DataTrainingArguments:
     test_file: Optional[str] = field(
         default=None,
         metadata={
-            "help": "An optional input test data file to evaluate the metrics (rouge) on " "(a jsonlines or csv file)."
+            "help": "An optional input test data file to evaluate the metrics (rouge) on "
+            "(a jsonlines or csv file)."
         },
     )
     overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
+        default=False,
+        metadata={"help": "Overwrite the cached training and evaluation sets"},
     )
     preprocessing_num_workers: Optional[int] = field(
         default=None,
@@ -184,7 +214,7 @@ class DataTrainingArguments:
         metadata={
             "help": "The maximum total input_prefix sequence length after tokenization. Sequences longer "
             "than this will be truncated, sequences shorter will be padded from the left "
-                    "(only used if prefixes are not merged)."
+            "(only used if prefixes are not merged)."
         },
     )
     max_target_length: Optional[int] = field(
@@ -246,7 +276,10 @@ class DataTrainingArguments:
         },
     )
     source_prefix: Optional[str] = field(
-        default=None, metadata={"help": "A prefix to add before every source text (useful for T5 models)."}
+        default=None,
+        metadata={
+            "help": "A prefix to add before every source text (useful for T5 models)."
+        },
     )
     data_dir: Optional[str] = field(
         default=None,
@@ -260,7 +293,9 @@ class DataTrainingArguments:
     )
     evaluate_on_training_data: bool = field(
         default=False,
-        metadata={"help": "Whether to evaluate on training data or not, to make sure the model can overfit."},
+        metadata={
+            "help": "Whether to evaluate on training data or not, to make sure the model can overfit."
+        },
     )
     folder_suffix: str = field(
         default="",
@@ -268,7 +303,9 @@ class DataTrainingArguments:
     )
     preprocess_only: bool = field(
         default=False,
-        metadata={"help": "Preprocess only: Don't start training, just do the things before"},
+        metadata={
+            "help": "Preprocess only: Don't start training, just do the things before"
+        },
     )
     assign_zero_to_too_long_val_examples: bool = field(
         default=False,
@@ -288,7 +325,7 @@ class DataTrainingArguments:
         default=False,
         metadata={
             "help": "Whether to pad the prefix if it exists to max_prefix_length. "
-                    "Note - important if you are using a SLED model on an input that contains an input_prefix"
+            "Note - important if you are using a SLED model on an input that contains an input_prefix"
         },
     )
     test_start_ind: Optional[int] = field(
@@ -315,20 +352,27 @@ class DataTrainingArguments:
     )
     oracle_training: Optional[bool] = field(
         default=False,
-        metadata={"help": "If True, train on the input sentences that provide the highest ROUGE score with the labels"}
+        metadata={
+            "help": "If True, train on the input sentences that provide the highest ROUGE score with the labels"
+        },
     )
     oracle_merge: Optional[bool] = field(
         default=False,
-        metadata={"help": "If True, merge the oracle dataset and the standard training dataset"}
+        metadata={
+            "help": "If True, merge the oracle dataset and the standard training dataset"
+        },
     )
+
     def __post_init__(self):
         if self.val_max_target_length is None:
             self.val_max_target_length = self.max_target_length
         if self.pad_prefix and self.max_prefix_length == 0:
-            raise ValueError('When padding prefix, you must set a max_prefix_length')
-        assert self.max_prefix_length == 0 or self.max_prefix_length <= 0.5*self.max_source_length,\
-            'If max_prefix_length is given, it must be much shorter than the total input'
-        # Uri: 
+            raise ValueError("When padding prefix, you must set a max_prefix_length")
+        assert (
+            self.max_prefix_length == 0
+            or self.max_prefix_length <= 0.5 * self.max_source_length
+        ), "If max_prefix_length is given, it must be much shorter than the total input"
+        # Uri:
         if self.eval_max_source_length is None:
             self.eval_max_source_length = self.max_source_length
 
@@ -338,11 +382,10 @@ class UnlimiformerArguments:
     """
     Arguments pertaining to what data we are going to input our model for training and eval.
     """
+
     test_unlimiformer: Optional[bool] = field(
         default=False,
-        metadata={
-            "help": "whether to use KNN."
-        },
+        metadata={"help": "whether to use KNN."},
     )
     unlimiformer_verbose: Optional[bool] = field(
         default=False,
@@ -352,13 +395,17 @@ class UnlimiformerArguments:
     )
     layer_begin: Optional[int] = field(
         default=0,
-        metadata={"help": "The layer to begin applying KNN to. KNN will be applied to layers[knn_layer_begin:layer_end]. "
-                          "By default, it will be applied to all layers: [0:None]]"}, 
+        metadata={
+            "help": "The layer to begin applying KNN to. KNN will be applied to layers[knn_layer_begin:layer_end]. "
+            "By default, it will be applied to all layers: [0:None]]"
+        },
     )
     layer_end: Optional[int] = field(
         default=None,
-        metadata={"help": "The layer to end applying KNN to. KNN will be applied to layers[knn_layer_begin:layer_end]. "
-                          "By default, it will be applied to all layers: [0:None]]"}, 
+        metadata={
+            "help": "The layer to end applying KNN to. KNN will be applied to layers[knn_layer_begin:layer_end]. "
+            "By default, it will be applied to all layers: [0:None]]"
+        },
     )
     unlimiformer_chunk_overlap: Optional[float] = field(
         default=0.5,
@@ -399,18 +446,31 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = CustomHfArgumentParser((ModelArguments, DataTrainingArguments, TrainingOverridesArguments, UnlimiformerArguments))
-    model_args, data_args, training_args, unlimiformer_args = parser.parse_dictionary_and_args()
-    
+    parser = CustomHfArgumentParser(
+        (
+            ModelArguments,
+            DataTrainingArguments,
+            TrainingOverridesArguments,
+            UnlimiformerArguments,
+        )
+    )
+    (
+        model_args,
+        data_args,
+        training_args,
+        unlimiformer_args,
+    ) = parser.parse_dictionary_and_args()
+
     set_up_logging(training_args)
     logger.info(f"Training Arguments: {training_args}")
     logger.info(f"Data Arguments: {data_args}")
     logger.info(f"Model Arguments: {model_args}")
     logger.info(f"Unlimiformer Arguments: {unlimiformer_args}")
 
-
     # Added to avoid wandb.errors.UsageError: Error communicating with wandb process
-    wandb.init(settings=wandb.Settings(start_method="fork"), name=training_args.output_dir)
+    wandb.init(
+        settings=wandb.Settings(start_method="fork"), name=training_args.output_dir
+    )
 
     # Used to find missing dependencies early on
     load_metric(data_args.metric_names, **locals())
@@ -452,14 +512,16 @@ def main():
 
     config_overrides = {}
     if training_args.gradient_checkpointing is not None:
-        config_overrides["gradient_checkpointing"] = training_args.gradient_checkpointing
+        config_overrides[
+            "gradient_checkpointing"
+        ] = training_args.gradient_checkpointing
 
     config = AutoConfig.from_pretrained(
         config_name,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=training_args.use_auth_token,
-        **config_overrides
+        **config_overrides,
     )
     # override for sled models to make sure we are explicit in our request
     # if isinstance(config, SledConfig) and (not data_args.pad_prefix or data_args.max_prefix_length == 0):
@@ -503,35 +565,46 @@ def main():
         )
     if unlimiformer_args.test_unlimiformer:
         unlimiformer_kwargs = {
-            'layer_begin': unlimiformer_args.layer_begin, 
-            'layer_end': unlimiformer_args.layer_end,
-            'unlimiformer_head_num': unlimiformer_args.unlimiformer_head_num, 
-            'exclude_attention': unlimiformer_args.unlimiformer_exclude, 
-            'chunk_overlap': unlimiformer_args.unlimiformer_chunk_overlap,
-            'model_encoder_max_len': unlimiformer_args.unlimiformer_chunk_size,
-            'verbose': unlimiformer_args.unlimiformer_verbose, 'tokenizer': tokenizer,
-            'unlimiformer_training': unlimiformer_args.unlimiformer_training,
-            'use_datastore': unlimiformer_args.use_datastore,
-            'flat_index': unlimiformer_args.flat_index,
-            'test_datastore': unlimiformer_args.test_datastore,
-            'reconstruct_embeddings': unlimiformer_args.reconstruct_embeddings,
-            'gpu_datastore': unlimiformer_args.gpu_datastore,
-            'gpu_index': unlimiformer_args.gpu_index
+            "layer_begin": unlimiformer_args.layer_begin,
+            "layer_end": unlimiformer_args.layer_end,
+            "unlimiformer_head_num": unlimiformer_args.unlimiformer_head_num,
+            "exclude_attention": unlimiformer_args.unlimiformer_exclude,
+            "chunk_overlap": unlimiformer_args.unlimiformer_chunk_overlap,
+            "model_encoder_max_len": unlimiformer_args.unlimiformer_chunk_size,
+            "verbose": unlimiformer_args.unlimiformer_verbose,
+            "tokenizer": tokenizer,
+            "unlimiformer_training": unlimiformer_args.unlimiformer_training,
+            "use_datastore": unlimiformer_args.use_datastore,
+            "flat_index": unlimiformer_args.flat_index,
+            "test_datastore": unlimiformer_args.test_datastore,
+            "reconstruct_embeddings": unlimiformer_args.reconstruct_embeddings,
+            "gpu_datastore": unlimiformer_args.gpu_datastore,
+            "gpu_index": unlimiformer_args.gpu_index,
         }
         if unlimiformer_args.random_unlimiformer_training:
-            model = RandomTrainingUnlimiformer.convert_model(model, **unlimiformer_kwargs)
+            model = RandomTrainingUnlimiformer.convert_model(
+                model, **unlimiformer_kwargs
+            )
         else:
             model = Unlimiformer.convert_model(model, **unlimiformer_kwargs)
 
     model.config.use_cache = True
-    if training_args.gradient_checkpointing and getattr(model.config, 'use_cache', False) and training_args.do_train:
-        logger.warning('Cannot use cache in models when using gradient checkpointing. turning it off')
+    if (
+        training_args.gradient_checkpointing
+        and getattr(model.config, "use_cache", False)
+        and training_args.do_train
+    ):
+        logger.warning(
+            "Cannot use cache in models when using gradient checkpointing. turning it off"
+        )
         model.config.use_cache = False
 
     model.resize_token_embeddings(len(tokenizer))
 
     if model.config.decoder_start_token_id is None:
-        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+        raise ValueError(
+            "Make sure that `config.decoder_start_token_id` is correctly defined"
+        )
 
     prefix = data_args.source_prefix if data_args.source_prefix is not None else ""
 
@@ -544,7 +617,9 @@ def main():
     elif training_args.do_predict:
         column_names = seq2seq_dataset["test"].column_names
     else:
-        logger.info("There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`.")
+        logger.info(
+            "There is nothing to do. Please pass `do_train`, `do_eval` and/or `do_predict`."
+        )
         return
 
     # Get the column names for input/target.
@@ -577,7 +652,9 @@ def main():
     max_target_length = data_args.max_target_length
     padding = "max_length" if data_args.pad_to_max_length else False
 
-    if training_args.label_smoothing_factor > 0 and not hasattr(model, "prepare_decoder_input_ids_from_labels"):
+    if training_args.label_smoothing_factor > 0 and not hasattr(
+        model, "prepare_decoder_input_ids_from_labels"
+    ):
         logger.warning(
             "label_smoothing is enabled but the `prepare_decoder_input_ids_from_labels` method is not defined for"
             f"`{model.__class__.__name__}`. This will lead to loss being calculated twice and will take up more memory"
@@ -598,7 +675,7 @@ def main():
             "ignore_pad_token_for_loss": data_args.ignore_pad_token_for_loss,
             "assign_zero_to_too_long_val_examples": data_args.assign_zero_to_too_long_val_examples,
             "trim_very_long_strings": data_args.trim_very_long_strings,
-            "pad_prefix": data_args.pad_prefix
+            "pad_prefix": data_args.pad_prefix,
         }
 
     if training_args.do_train:
@@ -607,17 +684,23 @@ def main():
         logger.info("")
         logger.info("Training examples before tokenization:")
         if input_prefix_column in column_names:
-            logger.info(f"input_prefix #0: {seq2seq_dataset['train'][0][input_prefix_column]}")
+            logger.info(
+                f"input_prefix #0: {seq2seq_dataset['train'][0][input_prefix_column]}"
+            )
         # logger.info(f"input #0: {seq2seq_dataset['train'][0]['input']}")
         # logger.info(f"output #0: {seq2seq_dataset['train'][0]['output']}")
         if input_prefix_column in column_names:
-            logger.info(f"input_prefix #1: {seq2seq_dataset['train'][1][input_prefix_column]}")
+            logger.info(
+                f"input_prefix #1: {seq2seq_dataset['train'][1][input_prefix_column]}"
+            )
         # logger.info(f"input #1: {seq2seq_dataset['train'][1]['input']}")
         # logger.info(f"output #1: {seq2seq_dataset['train'][1]['output']}")
         logger.info("")
         untokenized_train_dataset = seq2seq_dataset["train"]
         if data_args.max_train_samples is not None:
-            untokenized_train_dataset = untokenized_train_dataset.select(range(data_args.max_train_samples))
+            untokenized_train_dataset = untokenized_train_dataset.select(
+                range(data_args.max_train_samples)
+            )
 
         if DEBUG:
             # In debug mode, we want ot recreate the data
@@ -625,21 +708,22 @@ def main():
             data_args.overwrite_cache = True
         with training_args.main_process_first(
             local=not data_args.shared_storage, desc="train dataset map pre-processing"
-            ):
-
+        ):
             if data_args.oracle_training:
                 logger.info("Using oracle training")
-                oracle_processed_dir = f'oracle_input_{data_args.dataset_config_name}'
+                oracle_processed_dir = f"oracle_input_{data_args.dataset_config_name}"
                 if os.path.isdir(oracle_processed_dir):
                     logger.info(f"Using oracle training from {oracle_processed_dir}")
                     oracle_training_set = datasets.load_from_disk(oracle_processed_dir)
                 else:
-                    rouge_scorer = datasets.load_metric('rouge')
+                    rouge_scorer = datasets.load_metric("rouge")
                     oracle_training_set = untokenized_train_dataset.map(
                         extract_oracle_sent_batch,
-                        fn_kwargs={'max_length': data_args.max_source_length,
-                                'tokenizer': tokenizer,
-                                'rouge_scorer': rouge_scorer},
+                        fn_kwargs={
+                            "max_length": data_args.max_source_length,
+                            "tokenizer": tokenizer,
+                            "rouge_scorer": rouge_scorer,
+                        },
                         batched=True,
                         batch_size=1,
                         num_proc=data_args.preprocessing_num_workers,
@@ -647,11 +731,14 @@ def main():
                         desc="Extracting oracle sentences from every training example",
                     )
                     oracle_training_set.save_to_disk(oracle_processed_dir)
-                
-                
+
                 if data_args.oracle_merge:
-                    untokenized_train_dataset = datasets.concatenate_datasets([untokenized_train_dataset, oracle_training_set])
-                    untokenized_train_dataset = untokenized_train_dataset.shuffle(seed=training_args.seed)
+                    untokenized_train_dataset = datasets.concatenate_datasets(
+                        [untokenized_train_dataset, oracle_training_set]
+                    )
+                    untokenized_train_dataset = untokenized_train_dataset.shuffle(
+                        seed=training_args.seed
+                    )
                 else:
                     untokenized_train_dataset = oracle_training_set
 
@@ -668,7 +755,7 @@ def main():
             if data_args.chunked_training_size is not None:
                 train_dataset = train_dataset.map(
                     chunk_dataset_function,
-                    fn_kwargs={'chunk_size': data_args.chunked_training_size},
+                    fn_kwargs={"chunk_size": data_args.chunked_training_size},
                     batched=True,
                     num_proc=data_args.preprocessing_num_workers,
                     load_from_cache_file=not data_args.overwrite_cache,
@@ -680,25 +767,35 @@ def main():
         max_target_length = data_args.val_max_target_length
         preprocess_function_kwargs = preprocess_function_kwargs_fn()
         preprocess_function_kwargs["max_target_length"] = max_target_length
-        preprocess_function_kwargs['max_source_length'] = data_args.eval_max_source_length
+        preprocess_function_kwargs[
+            "max_source_length"
+        ] = data_args.eval_max_source_length
         if "validation" not in seq2seq_dataset:
             raise ValueError("--do_eval requires a validation dataset")
         logger.info("")
         logger.info("Validation examples before tokenization:")
         if input_prefix_column in column_names:
-            logger.info(f"input_prefix #0: {seq2seq_dataset['validation'][0][input_prefix_column]}")
+            logger.info(
+                f"input_prefix #0: {seq2seq_dataset['validation'][0][input_prefix_column]}"
+            )
         # logger.info(f"input #0: {seq2seq_dataset['validation'][0]['input']}")
         # logger.info(f"output #0: {seq2seq_dataset['validation'][0]['output']}")
         if input_prefix_column in column_names:
-            logger.info(f"input_prefix #1: {seq2seq_dataset['validation'][1][input_prefix_column]}")
+            logger.info(
+                f"input_prefix #1: {seq2seq_dataset['validation'][1][input_prefix_column]}"
+            )
         # logger.info(f"input #1: {seq2seq_dataset['validation'][1]['input']}")
         # logger.info(f"output #1: {seq2seq_dataset['validation'][1]['output']}")
         logger.info("")
         untokenized_eval_dataset = seq2seq_dataset["validation"]
         if data_args.max_eval_samples is not None:
-            untokenized_eval_dataset = untokenized_eval_dataset.select(range(data_args.max_eval_samples))
+            untokenized_eval_dataset = untokenized_eval_dataset.select(
+                range(data_args.max_eval_samples)
+            )
         if model_args.drop_duplicates_in_eval is True:
-            untokenized_eval_dataset = drop_duplicates_in_input(untokenized_eval_dataset)
+            untokenized_eval_dataset = drop_duplicates_in_input(
+                untokenized_eval_dataset
+            )
         untokenized_eval_dataset_orig = untokenized_eval_dataset
         assert training_args.eval_fraction > 0
         n = len(untokenized_eval_dataset)
@@ -706,43 +803,71 @@ def main():
         if training_args.eval_fraction != 1:
             if training_args.eval_fraction > 1:
                 assert training_args.eval_fraction == int(training_args.eval_fraction)
-                logger.info(f'using predetermined absolute samples from eval set ({training_args.eval_fraction} )')
+                logger.info(
+                    f"using predetermined absolute samples from eval set ({training_args.eval_fraction} )"
+                )
                 training_args.eval_fraction = training_args.eval_fraction / n
-            indices = np.random.permutation(n)[:int(np.ceil(max(1, training_args.eval_fraction * n)))]
-            untokenized_eval_dataset = type(untokenized_eval_dataset).from_dict(untokenized_eval_dataset[indices])
-            logger.info(f'During training, will only use {training_args.eval_fraction:.3%} samples of the eval set '
-                        f'which amounts to {len(untokenized_eval_dataset)} out of {n} samples')
+            indices = np.random.permutation(n)[
+                : int(np.ceil(max(1, training_args.eval_fraction * n)))
+            ]
+            untokenized_eval_dataset = type(untokenized_eval_dataset).from_dict(
+                untokenized_eval_dataset[indices]
+            )
+            logger.info(
+                f"During training, will only use {training_args.eval_fraction:.3%} samples of the eval set "
+                f"which amounts to {len(untokenized_eval_dataset)} out of {n} samples"
+            )
 
-        eval_dataset = process_eval_set(data_args, preprocess_function_kwargs, training_args, untokenized_eval_dataset)
+        eval_dataset = process_eval_set(
+            data_args,
+            preprocess_function_kwargs,
+            training_args,
+            untokenized_eval_dataset,
+        )
         eval_dataset_orig = eval_dataset
         if training_args.eval_fraction < 1:
-            eval_dataset_orig = process_eval_set(data_args, preprocess_function_kwargs, training_args,
-                                                 untokenized_eval_dataset_orig)
+            eval_dataset_orig = process_eval_set(
+                data_args,
+                preprocess_function_kwargs,
+                training_args,
+                untokenized_eval_dataset_orig,
+            )
 
     if training_args.do_predict:
         max_target_length = data_args.val_max_target_length
         preprocess_function_kwargs = preprocess_function_kwargs_fn()
         preprocess_function_kwargs["max_target_length"] = max_target_length
-        preprocess_function_kwargs['max_source_length'] = data_args.eval_max_source_length
+        preprocess_function_kwargs[
+            "max_source_length"
+        ] = data_args.eval_max_source_length
         if "test" not in seq2seq_dataset:
             raise ValueError("--do_predict requires a test dataset")
         untokenized_predict_dataset = seq2seq_dataset["test"]
         if data_args.max_predict_samples is not None:
-            untokenized_predict_dataset = untokenized_predict_dataset.select(range(data_args.max_predict_samples))
+            untokenized_predict_dataset = untokenized_predict_dataset.select(
+                range(data_args.max_predict_samples)
+            )
         if model_args.drop_duplicates_in_eval is True:
-            untokenized_predict_dataset = drop_duplicates_in_input(untokenized_predict_dataset)
+            untokenized_predict_dataset = drop_duplicates_in_input(
+                untokenized_predict_dataset
+            )
 
         if output_column in untokenized_predict_dataset.column_names:
-            untokenized_predict_dataset = untokenized_predict_dataset.remove_columns(output_column)
+            untokenized_predict_dataset = untokenized_predict_dataset.remove_columns(
+                output_column
+            )
 
         if data_args.test_start_ind is not None:
-            sind =  data_args.test_start_ind
+            sind = data_args.test_start_ind
             eind = -1 if data_args.test_end_ind is None else data_args.test_end_ind
-            logger.info(f'Using only a subset of the test dataset [{sind}, {eind}]')
-            untokenized_predict_dataset = type(untokenized_predict_dataset).from_dict(untokenized_predict_dataset[sind:eind])
+            logger.info(f"Using only a subset of the test dataset [{sind}, {eind}]")
+            untokenized_predict_dataset = type(untokenized_predict_dataset).from_dict(
+                untokenized_predict_dataset[sind:eind]
+            )
 
         with training_args.main_process_first(
-            local=not data_args.shared_storage, desc="prediction dataset map pre-processing"
+            local=not data_args.shared_storage,
+            desc="prediction dataset map pre-processing",
         ):
             predict_dataset = untokenized_predict_dataset.map(
                 preprocess_function,
@@ -759,9 +884,10 @@ def main():
         exit()
 
     # Data collator
-    label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
+    label_pad_token_id = (
+        -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
+    )
     pad_to = 8 if training_args.fp16 and training_args.fp16_padding else None
-
 
     data_collator = DataCollatorForSeq2Seq(
         tokenizer,
@@ -780,13 +906,19 @@ def main():
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
         eval_dataset=eval_dataset if training_args.do_eval else None,
-        untokenized_eval_dataset=untokenized_eval_dataset if training_args.do_eval else None,
+        untokenized_eval_dataset=untokenized_eval_dataset
+        if training_args.do_eval
+        else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics if training_args.predict_with_generate else None,
+        compute_metrics=compute_metrics
+        if training_args.predict_with_generate
+        else None,
         output_dir=training_args.output_dir,
         data_args=data_args,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=data_args.patience)] if data_args.patience is not None else None,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=data_args.patience)]
+        if data_args.patience is not None
+        else None,
     )
 
     # setup_cometml_trainer_callback(trainer)
@@ -800,12 +932,14 @@ def main():
             checkpoint = last_checkpoint  # look for checkpoints in the outdir
 
         train_result = trainer.train(resume_from_checkpoint=checkpoint)
-        logger.info('Done training')
+        logger.info("Done training")
         trainer.save_model()  # Saves the tokenizer too for easy upload
 
         metrics = train_result.metrics
         max_train_samples = (
-            data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+            data_args.max_train_samples
+            if data_args.max_train_samples is not None
+            else len(train_dataset)
         )
         metrics["train_samples"] = min(max_train_samples, len(train_dataset))
 
@@ -819,14 +953,22 @@ def main():
         logger.info("*** Evaluate ***")
 
         if training_args.eval_fraction < 1:
-            logger.info('setting the eval set back to the full one')
+            logger.info("setting the eval set back to the full one")
             trainer.eval_dataset = eval_dataset_orig
             trainer._untokenized_eval_dataset = untokenized_eval_dataset_orig
 
-        metrics = trainer.evaluate(metric_key_prefix="eval", use_cache=True, length_penalty=data_args.length_penalty)
-        logger.info('Done evaluating')
+        metrics = trainer.evaluate(
+            metric_key_prefix="eval",
+            use_cache=True,
+            length_penalty=data_args.length_penalty,
+        )
+        logger.info("Done evaluating")
 
-        max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+        max_eval_samples = (
+            data_args.max_eval_samples
+            if data_args.max_eval_samples is not None
+            else len(eval_dataset)
+        )
         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
 
         trainer.log_metrics("eval", metrics)
@@ -834,30 +976,44 @@ def main():
 
     if training_args.do_predict:
         logger.info("*** Predict ***")
-        trainer.args.predict_with_generate = True # during prediction, we don't have labels
+        trainer.args.predict_with_generate = (
+            True  # during prediction, we don't have labels
+        )
 
         # load last (and best) model, or the one specified if any
         logger.info("*** Loading model weights before the prediction ***")
-        last_checkpoint = model_args.model_name_or_path if os.path.isdir(model_args.model_name_or_path) else _detect_last_checkpoint(training_args)
+        last_checkpoint = (
+            model_args.model_name_or_path
+            if os.path.isdir(model_args.model_name_or_path)
+            else _detect_last_checkpoint(training_args)
+        )
         if last_checkpoint is not None and os.path.isdir(last_checkpoint):
-            logger.info(f'Loading weights from {last_checkpoint} for the prediction')
-            state_dict = torch.load(os.path.join(last_checkpoint, WEIGHTS_NAME), map_location="cpu")
+            logger.info(f"Loading weights from {last_checkpoint} for the prediction")
+            state_dict = torch.load(
+                os.path.join(last_checkpoint, WEIGHTS_NAME), map_location="cpu"
+            )
             # If the model is on the GPU, it still works!
             # trainer._load_state_dict_in_model(state_dict)
             # release memory
             del state_dict
             logger.info("*** Done loading weights ***")
         elif training_args.do_train:
-            raise ValueError('Could not find a model to load for prediction')
+            raise ValueError("Could not find a model to load for prediction")
         else:
-            logger.info(f'Using {model_args.model_name_or_path} as the model for the prediction')
+            logger.info(
+                f"Using {model_args.model_name_or_path} as the model for the prediction"
+            )
 
-        predict_results = trainer.predict(predict_dataset, metric_key_prefix="predict", use_cache=True)
-        logger.info('Done predicting')
+        predict_results = trainer.predict(
+            predict_dataset, metric_key_prefix="predict", use_cache=True
+        )
+        logger.info("Done predicting")
 
         metrics = predict_results.metrics
         max_predict_samples = (
-            data_args.max_predict_samples if data_args.max_predict_samples is not None else len(predict_dataset)
+            data_args.max_predict_samples
+            if data_args.max_predict_samples is not None
+            else len(predict_dataset)
         )
         metrics["predict_samples"] = min(max_predict_samples, len(predict_dataset))
 
@@ -873,17 +1029,24 @@ def main():
                 output_name = "generated_predictions.json"
                 if data_args.test_start_ind is not None:
                     output_name = f"generated_predictions_{data_args.test_start_ind}_{data_args.test_end_ind}.json"
-                output_prediction_file = os.path.join(training_args.output_dir, output_name)
+                output_prediction_file = os.path.join(
+                    training_args.output_dir, output_name
+                )
                 with open(output_prediction_file, "w") as writer:
                     json.dump(predictions, writer, indent=4)
 
     if training_args.push_to_hub:
-        kwargs = {"finetuned_from": model_args.model_name_or_path, "tasks": "summarization"}
+        kwargs = {
+            "finetuned_from": model_args.model_name_or_path,
+            "tasks": "summarization",
+        }
         if data_args.dataset_name is not None:
             kwargs["dataset_tags"] = data_args.dataset_name
             if data_args.dataset_config_name is not None:
                 kwargs["dataset_args"] = data_args.dataset_config_name
-                kwargs["dataset"] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
+                kwargs[
+                    "dataset"
+                ] = f"{data_args.dataset_name} {data_args.dataset_config_name}"
             else:
                 kwargs["dataset"] = data_args.dataset_name
 
@@ -891,22 +1054,29 @@ def main():
 
     return results
 
+
 def _detect_last_checkpoint(training_args):
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and training_args.do_train:
         if not training_args.overwrite_output_dir:
             last_checkpoint = get_last_checkpoint(training_args.output_dir)
 
-            if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+            if (
+                last_checkpoint is not None
+                and training_args.resume_from_checkpoint is None
+            ):
                 logger.info(
                     f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
                     "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
                 )
     return last_checkpoint
 
-def process_eval_set(data_args, preprocess_function_kwargs, training_args, untokenized_eval_dataset):
+
+def process_eval_set(
+    data_args, preprocess_function_kwargs, training_args, untokenized_eval_dataset
+):
     with training_args.main_process_first(
-            local=not data_args.shared_storage, desc="validation dataset map pre-processing"
+        local=not data_args.shared_storage, desc="validation dataset map pre-processing"
     ):
         eval_dataset = untokenized_eval_dataset.map(
             preprocess_function,
@@ -931,7 +1101,11 @@ def _get_dataset(data_args, model_args, training_args):
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
     data_files = None
-    if data_args.train_file is not None or data_args.validation_file is not None or data_args.test_file is not None:
+    if (
+        data_args.train_file is not None
+        or data_args.validation_file is not None
+        or data_args.test_file is not None
+    ):
         data_files = {}
         if data_args.train_file is not None:
             data_files["train"] = data_args.train_file
@@ -943,15 +1117,15 @@ def _get_dataset(data_args, model_args, training_args):
     seq2seq_dataset = load_dataset(
         data_args.dataset_name,
         data_args.dataset_config_name,
-        verification_mode='no_checks',
+        verification_mode="no_checks",
         cache_dir=model_args.cache_dir,
         data_dir=data_args.data_dir,
         data_files=data_files,
         download_mode=data_args.download_mode,
-        use_auth_token=training_args.use_auth_token
+        use_auth_token=training_args.use_auth_token,
     )
     if training_args.do_train:
-        training_args.apply_overrides(len(seq2seq_dataset['train']))
+        training_args.apply_overrides(len(seq2seq_dataset["train"]))
     if data_args.evaluate_on_training_data:
         seq2seq_dataset["validation"] = seq2seq_dataset["train"]
 
@@ -980,33 +1154,44 @@ def set_up_logging(training_args):
     )
     logger.info(f"Training/evaluation parameters {training_args}")
 
+
 def extract_oracle_sent_batch(examples, max_length, tokenizer, rouge_scorer):
     items = examples.data.items()
     keys = [item[0] for item in items]
     values = [item[1] for item in items]
     extracted = {k: [] for k in keys}
-    input_str = 'input'
+    input_str = "input"
 
     for ex in zip(*values):
         ex = dict(zip(keys, ex))
         ex_input = ex[input_str]
-        extracted_input = extract_oracle_sentences(ex_input, ex['output'], max_length, tokenizer, rouge_scorer)
+        extracted_input = extract_oracle_sentences(
+            ex_input, ex["output"], max_length, tokenizer, rouge_scorer
+        )
         extracted[input_str].append(extracted_input)
         for k in set(keys) - {input_str}:
             extracted[k].append(ex[k])
     return extracted
 
-def extract_oracle_sentences(input_sequence, output, max_length, tokenizer, rouge_scorer, criterion='rouge/geometric_mean'):
+
+def extract_oracle_sentences(
+    input_sequence,
+    output,
+    max_length,
+    tokenizer,
+    rouge_scorer,
+    criterion="rouge/geometric_mean",
+):
     sentences = nltk.sent_tokenize(input_sequence)
     selected_mask = [False for _ in sentences]
 
     max_rouge = 0.0
-    joined_selection = ''
+    joined_selection = ""
     counter = 0
     while len(tokenizer(joined_selection)) < max_length and counter < 100:
         cur_max_rouge = max_rouge
         max_index = -1
-        
+
         cur_candidate_indices = []
         cur_candidates = []
         for i in range(len(sentences)):
@@ -1015,30 +1200,41 @@ def extract_oracle_sentences(input_sequence, output, max_length, tokenizer, roug
                 continue
             candidate_mask = list(selected_mask)
             candidate_mask[i] = True
-            candidate_prediction = ' '.join(sent for sent, mask in zip(sentences, candidate_mask) if mask)
+            candidate_prediction = " ".join(
+                sent for sent, mask in zip(sentences, candidate_mask) if mask
+            )
             cur_candidates.append(candidate_prediction)
             cur_candidate_indices.append(i)
-        
-        rouge = rouge_scorer.compute(predictions=cur_candidates, references=[[output]] * len(cur_candidates), use_aggregator=False)
-        aggregated_rouge_types = [s1.fmeasure * s2.fmeasure * sL.fmeasure for s1, s2, sL in zip(rouge['rouge1'], rouge['rouge2'], rouge['rougeLsum'])]
+
+        rouge = rouge_scorer.compute(
+            predictions=cur_candidates,
+            references=[[output]] * len(cur_candidates),
+            use_aggregator=False,
+        )
+        aggregated_rouge_types = [
+            s1.fmeasure * s2.fmeasure * sL.fmeasure
+            for s1, s2, sL in zip(rouge["rouge1"], rouge["rouge2"], rouge["rougeLsum"])
+        ]
         max_index = np.argmax(aggregated_rouge_types)
         cur_max_rouge = aggregated_rouge_types[max_index]
-        
+
         if max_rouge >= cur_max_rouge:
             # No sentence improves the score
             break
-        
+
         selected_mask[cur_candidate_indices[max_index]] = True
         max_rouge = cur_max_rouge
-        joined_selection = ' '.join(sent for sent, mask in zip(sentences, selected_mask) if mask)
+        joined_selection = " ".join(
+            sent for sent, mask in zip(sentences, selected_mask) if mask
+        )
         counter += 1
-    
-    return joined_selection        
-    
+
+    return joined_selection
+
 
 def chunk_dataset_function(examples, chunk_size):
-    input_ids_str = 'input_ids'
-    attention_mask_str = 'attention_mask'
+    input_ids_str = "input_ids"
+    attention_mask_str = "attention_mask"
     items = examples.data.items()
     keys = [item[0] for item in items]
     values = [item[1] for item in items]
@@ -1046,8 +1242,8 @@ def chunk_dataset_function(examples, chunk_size):
     for ex in zip(*values):
         ex = dict(zip(keys, ex))
         for i in range(0, len(ex[input_ids_str]), chunk_size):
-            chunked_input_ids_st = ex[input_ids_str][i:i + chunk_size]
-            chunked_attention_mask = ex[attention_mask_str][i:i + chunk_size]
+            chunked_input_ids_st = ex[input_ids_str][i : i + chunk_size]
+            chunked_attention_mask = ex[attention_mask_str][i : i + chunk_size]
 
             if sum(chunked_attention_mask) < 10:
                 continue
@@ -1057,7 +1253,6 @@ def chunk_dataset_function(examples, chunk_size):
                 chunked[k].append(ex[k])
     return chunked
 
-    
 
 def preprocess_function(
     examples,
@@ -1074,23 +1269,53 @@ def preprocess_function(
     ignore_pad_token_for_loss,
     assign_zero_to_too_long_val_examples,
     trim_very_long_strings,
-    pad_prefix
+    pad_prefix,
 ):
     if not isinstance(examples[input_column][0], str):
         model_inputs = _preprocess_tokenized_inputs()
     else:
-        model_inputs = _preprocess_raw_inputs(assign_zero_to_too_long_val_examples, examples, input_column, input_prefix_column,
-                                              max_source_length, padding, prefix, tokenizer, trim_very_long_strings, max_prefix_length,
-                                              prefix_sep, pad_prefix)
+        model_inputs = _preprocess_raw_inputs(
+            assign_zero_to_too_long_val_examples,
+            examples,
+            input_column,
+            input_prefix_column,
+            max_source_length,
+            padding,
+            prefix,
+            tokenizer,
+            trim_very_long_strings,
+            max_prefix_length,
+            prefix_sep,
+            pad_prefix,
+        )
 
-    _preprocess_targets(examples, ignore_pad_token_for_loss, max_target_length, model_inputs, output_column, padding, tokenizer)
+    _preprocess_targets(
+        examples,
+        ignore_pad_token_for_loss,
+        max_target_length,
+        model_inputs,
+        output_column,
+        padding,
+        tokenizer,
+    )
     model_inputs["length"] = [len(x) for x in model_inputs["input_ids"]]
     return model_inputs
 
 
-def _preprocess_raw_inputs(assign_zero_to_too_long_val_examples, examples, input_column, input_prefix_column,
-                           max_source_length, padding, prefix, tokenizer, trim_very_long_strings, max_prefix_length,
-                           prefix_sep, pad_prefix):
+def _preprocess_raw_inputs(
+    assign_zero_to_too_long_val_examples,
+    examples,
+    input_column,
+    input_prefix_column,
+    max_source_length,
+    padding,
+    prefix,
+    tokenizer,
+    trim_very_long_strings,
+    max_prefix_length,
+    prefix_sep,
+    pad_prefix,
+):
     inputs = examples[input_column]
 
     # the given prefix is what used in models like T5 (e.g. "summarize: ")
@@ -1108,19 +1333,32 @@ def _preprocess_raw_inputs(assign_zero_to_too_long_val_examples, examples, input
         if trim_very_long_strings:
             input_prefixes = [inp[: max_prefix_length * 7] for inp in input_prefixes]
         if pad_prefix:
-            model_prefix_inputs = tokenizer(input_prefixes, max_length=max_prefix_length, padding='max_length', truncation=True)
+            model_prefix_inputs = tokenizer(
+                input_prefixes,
+                max_length=max_prefix_length,
+                padding="max_length",
+                truncation=True,
+            )
         else:
             # for led, we do not pad the prefix
-            model_prefix_inputs = tokenizer(input_prefixes, max_length=max_source_length, padding='do_not_pad', truncation=True)
+            model_prefix_inputs = tokenizer(
+                input_prefixes,
+                max_length=max_source_length,
+                padding="do_not_pad",
+                truncation=True,
+            )
 
     if trim_very_long_strings:
         inputs = [inp[: max_source_length * 7] for inp in inputs]
-    model_inputs = tokenizer(inputs, max_length=max_source_length, padding=padding, truncation=True)
+    model_inputs = tokenizer(
+        inputs, max_length=max_source_length, padding=padding, truncation=True
+    )
 
     if max_source_length is not None and assign_zero_to_too_long_val_examples:
         model_inputs_untrimmed = tokenizer(inputs)
         model_inputs["not_valid_for_eval"] = [
-            len(token_ids) > max_source_length for token_ids in model_inputs_untrimmed["input_ids"]
+            len(token_ids) > max_source_length
+            for token_ids in model_inputs_untrimmed["input_ids"]
         ]
     else:
         model_inputs["not_valid_for_eval"] = [False] * len(model_inputs["input_ids"])
@@ -1128,20 +1366,41 @@ def _preprocess_raw_inputs(assign_zero_to_too_long_val_examples, examples, input
     # now, combine the concat prefix to the input, trimming it to max_source_length if given
     if model_prefix_inputs is not None:
         max_source_length = max_source_length or -1
-        model_inputs['input_ids'] = [(inp1+inp2)[:max_source_length] for inp1, inp2
-                                     in zip(model_prefix_inputs['input_ids'], model_inputs['input_ids'])]
-        model_inputs['attention_mask'] = [(inp1+inp2)[:max_source_length] for inp1, inp2
-                                          in zip(model_prefix_inputs['attention_mask'], model_inputs['attention_mask'])]
+        model_inputs["input_ids"] = [
+            (inp1 + inp2)[:max_source_length]
+            for inp1, inp2 in zip(
+                model_prefix_inputs["input_ids"], model_inputs["input_ids"]
+            )
+        ]
+        model_inputs["attention_mask"] = [
+            (inp1 + inp2)[:max_source_length]
+            for inp1, inp2 in zip(
+                model_prefix_inputs["attention_mask"], model_inputs["attention_mask"]
+            )
+        ]
         # add prefix_length
         if pad_prefix:
             # no need to go over them as they will all be of the same length
-            model_inputs['prefix_length'] = [max_prefix_length] * len(model_inputs['input_ids'])
+            model_inputs["prefix_length"] = [max_prefix_length] * len(
+                model_inputs["input_ids"]
+            )
         else:
-            model_inputs['prefix_length'] = [len(inp) for inp in model_prefix_inputs['input_ids']]
+            model_inputs["prefix_length"] = [
+                len(inp) for inp in model_prefix_inputs["input_ids"]
+            ]
 
     return model_inputs
 
-def _preprocess_targets(examples, ignore_pad_token_for_loss, max_target_length, model_inputs, output_column, padding, tokenizer):
+
+def _preprocess_targets(
+    examples,
+    ignore_pad_token_for_loss,
+    max_target_length,
+    model_inputs,
+    output_column,
+    padding,
+    tokenizer,
+):
     targets = examples[output_column] if output_column in examples else None
     if targets is not None:
         if not isinstance(targets[0], str):
@@ -1151,16 +1410,23 @@ def _preprocess_targets(examples, ignore_pad_token_for_loss, max_target_length, 
         else:
             # Setup the tokenizer for targets
             with tokenizer.as_target_tokenizer():
-                labels = tokenizer(targets, max_length=max_target_length, padding=padding, truncation=True)
+                labels = tokenizer(
+                    targets,
+                    max_length=max_target_length,
+                    padding=padding,
+                    truncation=True,
+                )
 
             # If we are padding here, replace all tokenizer.pad_token_id in the labels by -100 when we want to ignore
             # padding in the loss.
             if padding == "max_length" and ignore_pad_token_for_loss:
                 labels["input_ids"] = [
-                    [(l if l != tokenizer.pad_token_id else -100) for l in label] for label in labels["input_ids"]
+                    [(l if l != tokenizer.pad_token_id else -100) for l in label]
+                    for label in labels["input_ids"]
                 ]
 
             model_inputs["labels"] = labels["input_ids"]
+
 
 def load_extra_metrics(metric_names, loaded_metrics=None):
     if loaded_metrics is None:
@@ -1170,6 +1436,7 @@ def load_extra_metrics(metric_names, loaded_metrics=None):
             if len(metric_name) > 0:
                 loaded_metrics._metrics.append(HFMetricWrapper(metric_name))
     return loaded_metrics
+
 
 def _mp_fn(index):
     # For xla_spawn (TPUs)
